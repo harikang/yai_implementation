@@ -1,5 +1,8 @@
 # yai_implementation
-NLP papers review with implementation
+NLP papers review with implementation.
+update every week (hopefully)
+
+Advises are always welcome:D
 
 # Objects
 1. Transformer
