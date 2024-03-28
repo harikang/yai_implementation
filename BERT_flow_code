@@ -1,0 +1,320 @@
+import torch.nn as nn
+import torch.nn.functional as F
+import torch
+
+import math
+# BERT는 입력을 만들기 위해 3가지 EMBEDDING이 더해진다. 
+
+# 첫째로 INPUT EMBEDDING의 역할을 하는 TOKENEMBEDDING이 있다. 
+class TokenEmbedding(nn.Embedding):
+    def __init__(self, vocab_size, embed_size=512):
+        super().__init__(vocab_size, embed_size, padding_idx=0)
+
+#둘째로, SegmentEmbedding으로 2가지의 문장을 분리하여 a와 b 문장을 분류한다.         
+class SegmentEmbedding(nn.Embedding):
+    def __init__(self, embed_size=512):
+        super().__init__(3, embed_size, padding_idx=0)
+
+# 마지막으로는 PositionalEmbedding으로,  adding positional information using sin, cos
+class PositionalEmbedding(nn.Module):
+
+    def __init__(self, d_model, max_len=512):
+        super().__init__()
+
+        # Compute the positional encodings once in log space.
+        pe = torch.zeros(max_len, d_model).float()  #(seq_len, hid_dim)의 차원으로 나타낼 수 있다. 
+        pe.require_grad = False
+
+        position = torch.arange(0, max_len).float().unsqueeze(1)
+        div_term = (torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model)).exp()  
+        #10000^{2i/d_model}->양변에 log를 취하면 2i/d_model*math.log(10000.0)->원래대로 돌리기 위해 양변에 exp()를 취하면 -> (2i.float() * -(math.log(10000.0) / d_model)).exp() 됨.
+
+        pe[:, 0::2] = torch.sin(position * div_term) #단어 별 FEATURE가 짝수일 때, 
+        pe[:, 1::2] = torch.cos(position * div_term) #단어 별 FEATURE가 수일 때,
+
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        return self.pe[:, :x.size(1)]
+
+#최종적인 BERT의 INPUT EMBDDING은 다음과 같다. 
+class BERTEmbedding(nn.Module):
+    def __init__(self, vocab_size, embed_size, dropout=0.1):
+        super().__init__()
+        self.token = TokenEmbedding(vocab_size=vocab_size, embed_size=embed_size) #token embdding
+        self.position = PositionalEmbedding(d_model=self.token.embedding_dim) #positional embedding
+        self.segment = SegmentEmbedding(embed_size=self.token.embedding_dim) #segment embedding
+        self.dropout = nn.Dropout(p=dropout)
+        self.embed_size = embed_size
+
+    def forward(self, sequence, segment_label):
+        x = self.token(sequence) + self.position(sequence) + self.segment(segment_label)
+        return self.dropout(x)
+
+# BERT는 encoder 구조를 여러개 쌓은 구조로 알 수 있고, ATTENTION BLOCK이 사용된다. 
+# 가장 먼저 attention block을 만들면 
+class MHA(nn.Module):
+    def __init__(self, hidden_dim, n_heads, dropout=0.1):
+        super().__init__()
+
+        self.hidden_dim = hidden_dim
+        self.n_heads = n_heads
+        self.head_dim = int(hidden_dim / n_heads) #각 head의 dimension ex)768/12=64 #bert는 12개의 head 
+
+        self.w_q = nn.Linear(hidden_dim, hidden_dim) # query parameter
+        self.w_k = nn.Linear(hidden_dim, hidden_dim) # key parameter
+        self.w_v = nn.Linear(hidden_dim, hidden_dim) # value parameter
+        self.w_o = nn.Linear(hidden_dim, hidden_dim) # outpu parameter 
+
+        self.scale = torch.sqrt(torch.tensor(self.head_dim)).to(DEVICE)
+
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, Q, K, V, mask = None, dropout=None):
+
+        batch_size = Q.shape[0] 
+
+        Q = self.w_q(Q) # (batch,seq_len, 768)
+        K = self.w_k(K)
+        V = self.w_v(V)
+
+        #head를 나눔
+        Q = Q.view(batch_size, -1, self.n_heads, self.head_dim).transpose(1, 2)  # (batch, n_head, seq_len, 64)
+        K = K.view(batch_size, -1, self.n_heads, self.head_dim).transpose(1, 2)  # (batch, n_head, seq_len, 64)
+        V = V.view(batch_size, -1, self.n_heads, self.head_dim).transpose(1, 2)  # (batch, n_head, seq_len, 64)
+
+        #attention 
+        atten_score = Q@K.permute(0,1,3,2)/self.scale # atten_score.shape = (batch, n_head, seq_len,seq_len)
+
+        if mask is not None:
+            attention_score[mask] = -1e10 # mask.shape = (batch, n_head, seq_len,seq_len)
+
+        attention_dist = torch.softmax(attention_score, dim=-1)
+
+        if dropout is not None:
+            attention_dist = dropout(attention_dist)        
+
+        attention = attention_dist @ V #attention=(batch,n_head,seq_len,64)
+
+        mha = attention.transpose(1,2).contiguous() #mha = (batch,seq_len,n_head,64)
+
+        x = x.view(batch_size, -1, self.hidden_dim) #x.shape = (batch,seq_len,768)
+        x = self.w_o(x) #output layer
+
+        return x, attention_dist
+
+class FFN(nn.Module):
+    def __init__(self, hidden_dim, ff_dim, drop_p):
+        super().__init__()
+        self.linear = nn.Sequential(nn.Linear(hidden_dim, ff_dim),
+                                    nn.ReLU(),
+                                    nn.Dropout(drop_p),                                     
+                                    nn.Linear(ff_dim, hidden_dim))    
+    def forward(self, x):
+        x = self.linear(x)
+        return x
+
+class BERTencoder(nn.Module):
+      def __init__(self, hidden_dim, n_heads, ff_dim, drop_p):
+          super().__init__()
+          self.self_atten = MHA(hidden_dim, n_heads,dropout=0.1) #8개의 head별 attention을 구하고 add
+          self.self_atten_LN = nn.LayerNorm(hidden_dim)
+          self.FF = FFN(hidden_dim, ff_dim, drop_p)
+          self.FFLN = nn.LayerNorm(hidden_dim)
+
+      def forward(self, x, enc_mask):
+        
+        residual, atten_enc = self.self_atten(x, x, x, enc_mask)
+        residual = self.dropout(residual)
+        x = self.self_atten_LN(x + residual) #residual은 attention을 거친 결과이고, x는 원래 값
+                                             #두 값이 더해져서 LN을 거친다. 
+        residual = self.FF(x)
+        residual = self.dropout(residual)
+        x = self.FF_LN(x + residual) # FF를 거치기 전 원본 X와 FF를 거친 residual이 더해져서
+                                     # LN을 거친다. 
+        return x, atten_enc #atten_enc는 각 layer마다의 attention score를 보여줌.
+                            #이는 layer가 쌓일수록 attention의 양상을 확인하기 위해 넣음.
+
+#####################################################################################################################
+#############################################   final model  ########################################################
+#####################################################################################################################
+
+class BERT(nn.Module):
+    def __init__(self, vocab_size, hidden=768, n_layers=12, attn_heads=12, dropout=0.1):
+        super().__init__()
+        self.hidden = hidden
+        self.n_layers = n_layers
+        self.attn_heads = attn_heads
+
+        # paper noted they used 4*hidden_size for ff_network_hidden_size
+        self.ff_dim = hidden * 4
+
+        # embedding for BERT, sum of positional, segment, token embeddings
+        self.embedding = BERTEmbedding(vocab_size=vocab_size, embed_size=hidden)
+
+        # multi-layers encoder blocks, deep network
+        self.BERTencoder_blocks = nn.ModuleList(
+            [BERTencoder(hidden, attn_heads, hidden * 4, dropout) for _ in range(n_layers)])
+
+    def forward(self, x, segment_info):
+        # attention masking for padded token
+        # torch.ByteTensor([batch_size, 1, seq_len, seq_len)
+        mask = (x > 0).unsqueeze(1).repeat(1, x.size(1), 1).unsqueeze(1)
+
+        # embedding the indexed sequence to sequence of vectors
+        x = self.embedding(x, segment_info)
+
+        # running over multiple BERT blocks
+        for transformer in self.BERTencoder_blocks:
+            x = transformer.forward(x, mask)
+
+        return x
+
+#####################################################################################################################
+#############################################   TRAIN model  ########################################################
+#####################################################################################################################
+
+import torch
+import torch.nn as nn
+from torch.optim import Adam
+from torch.utils.data import DataLoader
+
+from ..model import BERTLM, BERT
+from .optim_schedule import ScheduledOptim
+
+import tqdm
+
+class BERTTrainer:
+    """
+    BERT trains with 2 kinds of tasks, MLM & NSP.
+    """
+    def __init__(self, bert: BERT, vocab_size: int,
+                 train_dataloader: DataLoader, test_dataloader: DataLoader = None,
+                 lr: float = 1e-4, betas=(0.9, 0.999), weight_decay: float = 0.01, warmup_steps=10000,
+                 with_cuda: bool = True, cuda_devices=None, log_freq: int = 10):
+        """
+        :param bert: BERT model which you want to train
+        :param vocab_size: total word vocab size
+        :param train_dataloader: train dataset data loader
+        :param test_dataloader: test dataset data loader [can be None]
+        :param lr: learning rate of optimizer
+        :param betas: Adam optimizer betas
+        :param weight_decay: Adam optimizer weight decay param
+        :param with_cuda: traning with cuda
+        :param log_freq: logging frequency of the batch iteration
+        """
+
+        # Setup cuda device for BERT training, argument -c, --cuda should be true
+        cuda_condition = torch.cuda.is_available() and with_cuda
+        self.device = torch.device("cuda:0" if cuda_condition else "cpu")
+
+        # This BERT model will be saved every epoch
+        self.bert = bert
+        # Initialize the BERT Language Model, with BERT model
+        self.model = BERTLM(bert, vocab_size).to(self.device)
+
+        # Distributed GPU training if CUDA can detect more than 1 GPU
+        if with_cuda and torch.cuda.device_count() > 1:
+            print("Using %d GPUS for BERT" % torch.cuda.device_count())
+            self.model = nn.DataParallel(self.model, device_ids=cuda_devices)
+
+        # Setting the train and test data loader
+        self.train_data = train_dataloader
+        self.test_data = test_dataloader
+
+        # Setting the Adam optimizer with hyper-param -> USE ADAM optimizer 
+        self.optim = Adam(self.model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay)
+        self.optim_schedule = ScheduledOptim(self.optim, self.bert.hidden, n_warmup_steps=warmup_steps)
+
+        # Using Negative Log Likelihood Loss function for predicting the masked_token
+        self.criterion = nn.NLLLoss(ignore_index=0)
+
+        self.log_freq = log_freq
+
+        print("Total Parameters:", sum([p.nelement() for p in self.model.parameters()]))
+
+    def train(self, epoch):
+        self.iteration(epoch, self.train_data)
+
+    def test(self, epoch):
+        self.iteration(epoch, self.test_data, train=False)
+
+    def iteration(self, epoch, data_loader, train=True):
+        """
+        loop over the data_loader for training or testing
+        if on train status, backward operation is activated
+        and also auto save the model every peoch
+
+        :param epoch: current epoch index
+        :param data_loader: torch.utils.data.DataLoader for iteration
+        :param train: boolean value of is train or test
+        :return: None
+        """
+        str_code = "train" if train else "test"
+
+        # Setting the tqdm progress bar
+        data_iter = tqdm.tqdm(enumerate(data_loader),
+                              desc="EP_%s:%d" % (str_code, epoch),
+                              total=len(data_loader),
+                              bar_format="{l_bar}{r_bar}")
+
+        avg_loss = 0.0
+        total_correct = 0
+        total_element = 0
+
+        for i, data in data_iter:
+            # 0. batch_data will be sent into the device(GPU or cpu)
+            data = {key: value.to(self.device) for key, value in data.items()}
+
+            # 1. forward the next_sentence_prediction and masked_lm model
+            next_sent_output, mask_lm_output = self.model.forward(data["bert_input"], data["segment_label"])
+
+            # 2-1. NLL(negative log likelihood) loss of is_next classification result #다음문장인지 아닌지와 예측 비교 
+            next_loss = self.criterion(next_sent_output, data["is_next"])
+
+            # 2-2. NLLLoss of predicting masked token word # masking 예측과 GT 비교 
+            mask_loss = self.criterion(mask_lm_output.transpose(1, 2), data["bert_label"])
+
+            # 2-3. Adding next_loss and mask_loss : 3.4 Pre-training Procedure
+            loss = next_loss + mask_loss
+
+            # 3. backward and optimization only in train
+            if train:
+                self.optim_schedule.zero_grad()
+                loss.backward()
+                self.optim_schedule.step_and_update_lr()
+
+            # next sentence prediction accuracy
+            correct = next_sent_output.argmax(dim=-1).eq(data["is_next"]).sum().item()
+            avg_loss += loss.item()
+            total_correct += correct
+            total_element += data["is_next"].nelement()
+
+            post_fix = {
+                "epoch": epoch,
+                "iter": i,
+                "avg_loss": avg_loss / (i + 1),
+                "avg_acc": total_correct / total_element * 100,
+                "loss": loss.item()
+            }
+
+            if i % self.log_freq == 0:
+                data_iter.write(str(post_fix))
+
+        print("EP%d_%s, avg_loss=" % (epoch, str_code), avg_loss / len(data_iter), "total_acc=",
+              total_correct * 100.0 / total_element)
+
+    def save(self, epoch, file_path="output/bert_trained.model"):
+        """
+        Saving the current BERT model on file_path
+
+        :param epoch: current epoch number
+        :param file_path: model output path which gonna be file_path+"ep%d" % epoch
+        :return: final_output_path
+        """
+        output_path = file_path + ".ep%d" % epoch
+        torch.save(self.bert.cpu(), output_path)
+        self.bert.to(self.device)
+        print("EP:%d Model Saved on:" % epoch, output_path)
+        return output_path
